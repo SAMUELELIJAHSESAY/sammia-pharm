@@ -40,6 +40,7 @@ let inventoryUser = null;
 const inventoryCachePriming = new Set();
 let inventorySyncHandler = null;
 let inventoryRefreshAfterSync = false;
+let inventoryDataRequestSequence = 0;
 
 const inventoryState = {
   page: 1,
@@ -122,9 +123,12 @@ async function primeInventoryWorkspaceCache(user, branchList = []) {
   }
 }
 
-async function loadCachedInventory(user) {
-  inventoryOfflineScope = getInventoryScope(user);
-  const cached = await queryCachedInventoryProducts(inventoryOfflineScope, getInventoryQueryOptions());
+async function loadCachedInventory(user, { queryOptions = getInventoryQueryOptions(), commitGuard = () => true } = {}) {
+  const scope = getInventoryScope(user);
+  const cached = await queryCachedInventoryProducts(scope, queryOptions);
+  if (!commitGuard()) return { stale: true };
+
+  inventoryOfflineScope = scope;
   inventoryState.summary = cached.summary;
   inventoryState.categories = cached.categories;
   inventoryState.totalCount = cached.count;
@@ -134,40 +138,55 @@ async function loadCachedInventory(user) {
   const totalPages = Math.max(1, Math.ceil(inventoryState.totalCount / inventoryState.pageSize));
   if (inventoryState.page > totalPages) {
     inventoryState.page = totalPages;
-    const corrected = await queryCachedInventoryProducts(inventoryOfflineScope, getInventoryQueryOptions());
+    const correctedOptions = { ...queryOptions, page: totalPages };
+    const corrected = await queryCachedInventoryProducts(scope, correctedOptions);
+    if (!commitGuard()) return { stale: true };
     inventoryState.totalCount = corrected.count;
     allProducts = corrected.products;
   }
   return cached;
 }
 
-async function fetchInventoryData(user, { refreshMeta = false, preferCache = false } = {}) {
+async function fetchInventoryData(user, { refreshMeta = false, preferCache = false, commitGuard = () => true } = {}) {
   const pharmacyId = user.profile.pharmacy_id;
-  inventoryOfflineScope = getInventoryScope(user);
+  const queryOptions = { ...getInventoryQueryOptions() };
+  const requestScope = getInventoryScope(user, queryOptions.branchId);
 
   if (preferCache || !navigator.onLine) {
-    return loadCachedInventory(user);
+    return loadCachedInventory(user, { queryOptions, commitGuard });
   }
 
   try {
-    const pagePromise = getProductsPage(pharmacyId, getInventoryQueryOptions());
+    const pagePromise = getProductsPage(pharmacyId, queryOptions);
     let pageResult;
+    let nextSummary = inventoryState.summary;
+    let nextCategories = inventoryState.categories;
+
     if (refreshMeta) {
       const [result, summary, categories] = await Promise.all([
         pagePromise,
-        getInventorySummary(pharmacyId, selectedBranchId),
-        getProductCategories(pharmacyId, selectedBranchId)
+        getInventorySummary(pharmacyId, queryOptions.branchId),
+        getProductCategories(pharmacyId, queryOptions.branchId)
       ]);
       pageResult = result;
-      inventoryState.summary = summary;
-      inventoryState.categories = categories;
+      nextSummary = summary;
+      nextCategories = categories;
     } else {
       pageResult = await pagePromise;
     }
 
-    await mergeCachedPOSProducts(inventoryOfflineScope, pageResult.products || []);
-    const cachedVisible = await getCachedPOSProductsByIds(inventoryOfflineScope, (pageResult.products || []).map((product) => product.id));
+    if (!commitGuard()) return { stale: true };
+
+    await mergeCachedPOSProducts(requestScope, pageResult.products || []);
+    if (!commitGuard()) return { stale: true };
+
+    const cachedVisible = await getCachedPOSProductsByIds(requestScope, (pageResult.products || []).map((product) => product.id));
+    if (!commitGuard()) return { stale: true };
+
     const cachedById = new Map(cachedVisible.map((product) => [product.id, product]));
+    inventoryOfflineScope = requestScope;
+    inventoryState.summary = nextSummary;
+    inventoryState.categories = nextCategories;
     inventoryState.totalCount = pageResult.count;
     allProducts = (pageResult.products || []).map((product) => cachedById.get(product.id) || product);
     inventoryOfflineMode = false;
@@ -175,28 +194,39 @@ async function fetchInventoryData(user, { refreshMeta = false, preferCache = fal
     const totalPages = Math.max(1, Math.ceil(inventoryState.totalCount / inventoryState.pageSize));
     if (inventoryState.page > totalPages) {
       inventoryState.page = totalPages;
-      const corrected = await getProductsPage(pharmacyId, getInventoryQueryOptions());
-      await mergeCachedPOSProducts(inventoryOfflineScope, corrected.products || []);
-      const correctedCached = await getCachedPOSProductsByIds(inventoryOfflineScope, (corrected.products || []).map((product) => product.id));
+      const correctedOptions = { ...queryOptions, page: totalPages };
+      const corrected = await getProductsPage(pharmacyId, correctedOptions);
+      if (!commitGuard()) return { stale: true };
+      await mergeCachedPOSProducts(requestScope, corrected.products || []);
+      if (!commitGuard()) return { stale: true };
+      const correctedCached = await getCachedPOSProductsByIds(requestScope, (corrected.products || []).map((product) => product.id));
+      if (!commitGuard()) return { stale: true };
       const correctedById = new Map(correctedCached.map((product) => [product.id, product]));
       inventoryState.totalCount = corrected.count;
       allProducts = (corrected.products || []).map((product) => correctedById.get(product.id) || product);
     }
 
-    if (refreshMeta) primeInventoryBranchCache(user, selectedBranchId).catch(() => {});
+    if (refreshMeta && commitGuard()) primeInventoryBranchCache(user, queryOptions.branchId).catch(() => {});
     return pageResult;
   } catch (error) {
+    if (!commitGuard()) return { stale: true };
     const bootstrap = await getCachedInventoryBootstrap(user.id, pharmacyId).catch(() => null);
     if (!bootstrap) throw error;
-    await loadCachedInventory(user);
-    return { offline: true };
+    return loadCachedInventory(user, { queryOptions, commitGuard });
   }
 }
 
 async function refreshInventory(container, user, branchList, options = {}) {
   const { refreshMeta = false, focusSearch = false, preferCache = false } = options;
+  const requestId = ++inventoryDataRequestSequence;
+  const requestKey = JSON.stringify(getInventoryQueryOptions());
+  const commitGuard = () => requestId === inventoryDataRequestSequence
+    && JSON.stringify(getInventoryQueryOptions()) === requestKey;
+
   try {
-    await fetchInventoryData(user, { refreshMeta, preferCache });
+    const result = await fetchInventoryData(user, { refreshMeta, preferCache, commitGuard });
+    if (result?.stale || !commitGuard()) return;
+
     renderView(container, allProducts, user, branchList);
     updateInventoryConnectivityUI(user).catch(() => {});
     if (focusSearch) {
@@ -208,6 +238,7 @@ async function refreshInventory(container, user, branchList, options = {}) {
       }
     }
   } catch (err) {
+    if (!commitGuard()) return;
     showToast(`Failed to load inventory: ${err.message}`, 'error');
   }
 }
@@ -715,14 +746,18 @@ function renderView(container, products, user, branchList) {
     }
   });
 
-  const searchProducts = debounce(async (value) => {
-    inventoryState.search = String(value || '').trim();
+  const searchProducts = debounce(async () => {
+    await refreshPage({ focusSearch: true });
+  }, 300);
+
+  document.getElementById('product-search')?.addEventListener('input', (event) => {
+    // Update the in-memory value immediately so a slower, older request can never
+    // rebuild the page with text the cashier/admin has already typed past.
+    inventoryState.search = String(event.target.value || '');
     currentSearchTerm = inventoryState.search;
     inventoryState.page = 1;
-    await refreshPage({ focusSearch: true });
-  }, 350);
-
-  document.getElementById('product-search')?.addEventListener('input', (event) => searchProducts(event.target.value));
+    searchProducts();
+  });
   document.getElementById('cat-filter')?.addEventListener('change', async (event) => {
     inventoryState.category = event.target.value;
     inventoryState.page = 1;

@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v2.0.35';
+const CACHE_VERSION = 'v2.0.36';
 const CACHE_NAME = `sammia-pharm-shell-${CACHE_VERSION}`;
 const CACHE_PREFIX = 'sammia-pharm-shell-';
 const LEGACY_CACHE_PREFIX = 'pharmacare-shell-';
